@@ -7,6 +7,7 @@ from lmcache.logging import init_logger
 from lmcache.v1.compute.blend.metadata import LMCBlendCommonMetadata, LMCBlendMetadata
 from lmcache.v1.config import LMCacheEngineConfig
 import torch
+import torch.distributed as dist
 
 # First Party
 from lmcache_ascend.v1.blend.models.utils import infer_model_from_vllm
@@ -103,14 +104,22 @@ class LMCBlender:
                 (k[num_falses:].to(torch.float32) - old_k.to(torch.float32)) ** 2,
                 dim=[1],
             )
+            diff_v = torch.sum(
+                (v[num_falses:].to(torch.float32) - old_v.to(torch.float32)) ** 2,
+                dim=[1],
+            )
+            diff_kv = diff_k + diff_v
 
-            total_len = diff_k.shape[0]
+            if kwargs.get("sync_tp_kv_score", False):
+                diff_kv = self._all_reduce_tp_sum(diff_kv)
+
+            total_len = diff_kv.shape[0]
 
             # TODO(Jiayi): remove `[0]` hardcode
             topk_num = int(total_len * self.common_metadata.recomp_ratios[0])
             topk_num = max(topk_num, 1)
 
-            top_indices = torch.topk(diff_k, k=topk_num).indices
+            top_indices = torch.topk(diff_kv, k=topk_num).indices
             top_indices, _ = torch.sort(top_indices)
 
             k, v = k[top_indices], v[top_indices]
@@ -135,6 +144,24 @@ class LMCBlender:
             return q, old_k, old_v, residual, attn_output, attn_metadata
         else:
             return q, k, v, residual, attn_output, attn_metadata
+
+    def _all_reduce_tp_sum(self, tensor: torch.Tensor) -> torch.Tensor:
+        """All-reduce a 1D score tensor in TP group to make rank-consistent topk."""
+        if not (dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1):
+            return tensor
+
+        group = None
+        try:
+            # Third Party
+            from vllm.distributed.parallel_state import get_tp_group
+
+            tp_group = get_tp_group()
+            group = getattr(tp_group, "device_group", None)
+        except Exception:
+            group = None
+
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=group)
+        return tensor
 
     # NOTE(Jiayi): Exposing this `blend_layer` interface as we might
     # want to ochestrate the blending process elsewhere

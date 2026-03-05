@@ -101,6 +101,7 @@ class LMCQwen3Model(LMCModel):
                 attn_metadata,
                 mask,
                 qk_post_processing=qk_post_processing,
+                sync_tp_kv_score=(idx < 4),
             )
             if q.numel() == 0:
                 no_more_queries = True
